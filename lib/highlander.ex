@@ -35,6 +35,37 @@ defmodule Highlander do
     {:stop, {:shutdown, :name_conflict}, Map.delete(state, :pid)}
   end
 
+  def handle_info({:EXIT, _pid, :shutdown}, state) do
+    {:stop, {:shutdown, :name_conflict}, Map.delete(state, :pid)}
+  end
+
+  def handle_info({_, _} = msg, state) do
+    case Map.get(state, :child_pid) do
+      nil ->
+        # We're not the leader, forward to the global registered leader
+        pid = :global.whereis_name(name(state))
+        send(pid, msg)
+
+      child_pid ->
+        # We're the leader, forward to our child
+        send(child_pid, msg)
+    end
+
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_call(msg, _from, state) do
+    {:reply, GenServer.call(state.child_pid, msg), state}
+  end
+
+  @impl true
+  def handle_cast(msg, state) do
+    GenServer.cast(state.child_pid, msg)
+
+    {:noreply, state}
+  end
+
   @impl true
   def terminate(reason, %{pid: pid}) do
     :ok = Supervisor.stop(pid, reason)
@@ -59,8 +90,16 @@ defmodule Highlander do
   end
 
   defp start(state) do
-    {:ok, pid} = Supervisor.start_link([state.child_spec], strategy: :one_for_one)
-    Map.put(state, :pid, pid)
+    {:ok, supervisor_pid} = Supervisor.start_link([state.child_spec], strategy: :one_for_one)
+    child_pid = get_child_pid(supervisor_pid)
+    Map.merge(state, %{pid: supervisor_pid, child_pid: child_pid})
+  end
+
+  defp get_child_pid(supervisor_pid) do
+    case Supervisor.which_children(supervisor_pid) do
+      [{_id, child_pid, _type, _modules}] when is_pid(child_pid) -> child_pid
+      _ -> nil
+    end
   end
 
   defp monitor(state) do
@@ -70,7 +109,7 @@ defmodule Highlander do
 
       pid ->
         ref = Process.monitor(pid)
-        %{child_spec: state.child_spec, ref: ref}
+        %{child_spec: state.child_spec, ref: ref, pid: pid}
     end
   end
 end
